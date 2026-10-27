@@ -1,0 +1,1196 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import date, datetime
+from typing import Optional
+
+from app.contacts import build_contacts_prompt
+from app.context import build_context_prompt
+from app.conversation import ConversationManager
+from app.date_resolver import normalize_time, resolve_relative_date
+from app.gemini_client import ask_gemini
+from app.scheduler import (
+    check_availability,
+    create_appointment,
+    find_available_slots,
+    is_within_business_hours,
+)
+
+
+# ============================================================
+# FAST LOCAL UNDERSTANDING
+# ============================================================
+
+BOOKING_PATTERNS = [
+    r"\bbook\b",
+    r"\bbooking\b",
+    r"\bschedule\b",
+    r"\bscheduling\b",
+    r"\bmeeting\b",
+    r"\bappointment\b",
+    r"\barrange\b",
+    r"\bset\s*up\b",
+    r"\btalk\s+to\b",
+    r"\bspeak\s+to\b",
+    r"\bmeet\s+with\b",
+    r"\bwant\s+to\s+meet\b",
+    r"\bwants\s+to\s+meet\b",
+    r"\bwould\s+like\s+to\s+meet\b",
+    r"\bneed\s+to\s+meet\b",
+    r"\bneed\s+a\s+meeting\b",
+    r"\bcan\s+i\s+meet\b",
+    r"\bcould\s+i\s+meet\b",
+    r"\bwould\s+like\s+to\s+speak\b",
+    r"\bwant\s+to\s+speak\b",
+    r"\bwant\s+to\s+talk\b",
+    r"\bwould\s+like\s+to\s+talk\b",
+    r"\bmeet\s+(?:with\s+)?harsha\b",
+    r"\btalk\s+to\s+harsha\b",
+    r"\bspeak\s+to\s+harsha\b",
+]
+
+
+DATE_WORDS = {
+    "today",
+    "tomorrow",
+    "tmrw",
+    "tommorow",
+    "day after tomorrow",
+    "day after tmrw",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
+
+
+def contains_booking_intent(text: str) -> bool:
+    lowered = text.lower()
+
+    return any(
+        re.search(pattern, lowered)
+        for pattern in BOOKING_PATTERNS
+    )
+
+
+# ============================================================
+# BASIC LOCAL EXTRACTION
+# ============================================================
+
+def extract_email(text: str) -> Optional[str]:
+    match = re.search(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        text,
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def extract_phone(text: str) -> Optional[str]:
+    matches = re.findall(
+        r"(?<!\d)(?:\+?\d[\d\s\-()]{7,}\d)(?!\d)",
+        text,
+    )
+
+    if not matches:
+        return None
+
+    phone = matches[0].strip()
+    digits = re.sub(r"\D", "", phone)
+
+    if len(digits) < 8 or len(digits) > 15:
+        return None
+
+    return phone
+
+
+def extract_time_from_text(text: str) -> Optional[str]:
+    patterns = [
+        r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b",
+        r"\b\d{1,2}\s*(?:am|pm)\b",
+        r"\b\d{1,2}:\d{2}\b",
+    ]
+
+    lowered = text.lower()
+
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+
+        if match:
+            normalized = normalize_time(match.group(0))
+
+            if normalized:
+                return normalized
+
+    return None
+
+
+def extract_date_from_text(text: str) -> Optional[str]:
+    lowered = text.lower().strip()
+
+    date_expressions = [
+        "day after tomorrow",
+        "day after tmrw",
+        "next week monday",
+        "next week tuesday",
+        "next week wednesday",
+        "next week thursday",
+        "next week friday",
+        "next week saturday",
+        "next week sunday",
+        "monday next week",
+        "tuesday next week",
+        "wednesday next week",
+        "thursday next week",
+        "friday next week",
+        "saturday next week",
+        "sunday next week",
+        "coming monday",
+        "coming tuesday",
+        "coming wednesday",
+        "coming thursday",
+        "coming friday",
+        "coming saturday",
+        "coming sunday",
+        "next monday",
+        "next tuesday",
+        "next wednesday",
+        "next thursday",
+        "next friday",
+        "next saturday",
+        "next sunday",
+        "tomorrow",
+        "tmrw",
+        "tommorow",
+        "today",
+    ]
+
+    for expression in date_expressions:
+        if expression in lowered:
+            resolved = resolve_relative_date(
+                expression,
+                reference_date=date.today(),
+            )
+
+            if resolved:
+                return resolved
+
+    for weekday in DATE_WORDS:
+        if weekday in lowered:
+            resolved = resolve_relative_date(
+                weekday,
+                reference_date=date.today(),
+            )
+
+            if resolved:
+                return resolved
+
+    match = re.search(
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        lowered,
+    )
+
+    if match:
+        resolved = resolve_relative_date(
+            match.group(0),
+            reference_date=date.today(),
+        )
+
+        if resolved:
+            return resolved
+
+    match = re.search(
+        r"\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b",
+        lowered,
+    )
+
+    if match:
+        resolved = resolve_relative_date(
+            match.group(0),
+            reference_date=date.today(),
+        )
+
+        if resolved:
+            return resolved
+
+    return None
+
+
+# ============================================================
+# NAME DETECTION
+# ============================================================
+
+def is_simple_name(text: str) -> bool:
+    """
+    Detect a standalone human name.
+
+    Used only when the conversation state indicates
+    that the receptionist is waiting for the caller's name.
+    """
+
+    cleaned = text.strip()
+
+    if not cleaned:
+        return False
+
+    if len(cleaned) > 50:
+        return False
+
+    if not re.fullmatch(
+        r"[A-Za-z][A-Za-z .'-]*",
+        cleaned,
+    ):
+        return False
+
+    blocked = {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "okay",
+        "ok",
+        "sure",
+        "hello",
+        "hi",
+        "hey",
+        "meeting",
+        "appointment",
+        "booking",
+        "schedule",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "today",
+        "tomorrow",
+    }
+
+    return cleaned.lower() not in blocked
+
+
+# ============================================================
+# LOCAL BOOKING INFORMATION
+# ============================================================
+
+def extract_simple_booking_information(
+    text: str,
+    manager: ConversationManager,
+) -> dict:
+    """
+    Perform high-confidence local extraction.
+
+    Context from ConversationManager is used so that simple
+    answers such as "Harsha" and "web application" are understood
+    without another Gemini request.
+    """
+
+    information = {}
+
+    lowered = text.lower().strip()
+    state = manager.get_state()
+
+    # Meeting intent
+    if contains_booking_intent(lowered):
+        information["wants_meeting"] = True
+
+    # Email
+    email = extract_email(text)
+
+    if email:
+        information["caller_email"] = email
+
+    # Phone
+    phone = extract_phone(text)
+
+    if phone:
+        information["caller_phone"] = phone
+
+    # Time
+    time_value = extract_time_from_text(text)
+
+    if time_value:
+        information["time_text"] = time_value
+
+    # Date
+    date_value = extract_date_from_text(text)
+
+    if date_value:
+        information["date_value"] = date_value
+
+    # Explicit caller name
+    name_match = re.search(
+        r"\b(?:my name is|i am|i'm|this is|name's)\s+"
+        r"([A-Za-z][A-Za-z .'-]{1,50})",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if name_match:
+        name = name_match.group(1).strip()
+
+        name = re.split(
+            r"\b(?:and|my email|email|phone|number)\b",
+            name,
+            flags=re.IGNORECASE,
+        )[0].strip()
+
+        # Remove sentence-ending punctuation.
+        name = name.strip().rstrip(" .,'-!")
+
+        if name:
+            information["caller_name"] = name
+
+    # Contextual caller name
+    if (
+        not information.get("caller_name")
+        and not state.caller_name
+        and state.meeting_requested
+        and is_simple_name(text)
+    ):
+        information["caller_name"] = text.strip().rstrip(" .,'-!")
+
+    # Explicit meeting-purpose statements can be captured even when
+    # the email address or other booking details are still missing.
+    purpose_patterns = (
+        r"^(?:the\s+)?meeting\s+is\s+about\s+(.+?)\s*[.!?]*$",
+        r"^(?:it\s+is|it's|its)\s+about\s+(.+?)\s*[.!?]*$",
+        r"^(?:we\s+need\s+to\s+discuss|i\s+(?:want|need)\s+to\s+discuss|"
+        r"i'd\s+like\s+to\s+discuss)\s+(.+?)\s*[.!?]*$",
+        r"^(?:the\s+)?purpose\s+is\s+(.+?)\s*[.!?]*$",
+        r"^regarding\s+(.+?)\s*[.!?]*$",
+    )
+
+    if (
+        state.meeting_requested
+        and not state.meeting_purpose
+        and not information.get("caller_email")
+        and not information.get("caller_phone")
+        and not information.get("date_value")
+        and not information.get("time_text")
+        and not information.get("caller_name")
+    ):
+        purpose_candidate = text.strip()
+
+        for pattern in purpose_patterns:
+            purpose_match = re.match(
+                pattern,
+                purpose_candidate,
+                flags=re.IGNORECASE,
+            )
+
+            if purpose_match:
+                purpose_candidate = (
+                    purpose_match.group(1).strip().rstrip(" .,!?")
+                )
+                break
+        else:
+            purpose_candidate = ""
+
+        blocked_purpose_answers = {
+            "yes",
+            "yeah",
+            "yep",
+            "yup",
+            "okay",
+            "ok",
+            "sure",
+            "confirm",
+            "confirmed",
+            "go ahead",
+            "no",
+            "nope",
+            "cancel",
+            "cancel it",
+            "cancel the booking",
+            "cancel the meeting",
+            "stop",
+            "never mind",
+            "nevermind",
+        }
+
+        if (
+            purpose_candidate
+            and purpose_candidate.lower() not in blocked_purpose_answers
+            and len(purpose_candidate) <= 200
+        ):
+            information["meeting_purpose"] = purpose_candidate
+
+    # Preserve contextual fallback for short purpose answers such as
+    # "web application" once the required booking details are known.
+    if (
+        state.meeting_requested
+        and state.caller_name
+        and state.caller_email
+        and state.meeting_date
+        and state.meeting_time
+        and not state.meeting_purpose
+        and not information.get("meeting_purpose")
+        and not information.get("caller_email")
+        and not information.get("caller_phone")
+        and not information.get("date_value")
+        and not information.get("time_text")
+        and not information.get("caller_name")
+    ):
+        purpose = text.strip().rstrip(" .,!?")
+
+        blocked_purpose_answers = {
+            "yes",
+            "yeah",
+            "yep",
+            "yup",
+            "okay",
+            "ok",
+            "sure",
+            "confirm",
+            "confirmed",
+            "go ahead",
+            "no",
+            "nope",
+            "cancel",
+            "cancel it",
+            "cancel the booking",
+            "cancel the meeting",
+            "stop",
+            "never mind",
+            "nevermind",
+        }
+
+        if (
+            purpose
+            and purpose.lower() not in blocked_purpose_answers
+            and not contains_booking_intent(purpose)
+            and len(purpose) <= 200
+        ):
+            information["meeting_purpose"] = purpose
+
+    return information
+
+
+def apply_local_information(
+    information: dict,
+    manager: ConversationManager,
+):
+    updates = {}
+
+    if information.get("wants_meeting"):
+        updates["meeting_requested"] = True
+
+    if information.get("caller_name"):
+        updates["caller_name"] = information["caller_name"]
+
+    if information.get("caller_email"):
+        updates["caller_email"] = information["caller_email"]
+
+    if information.get("caller_phone"):
+        updates["caller_phone"] = information["caller_phone"]
+
+    if information.get("date_value"):
+        updates["meeting_date"] = information["date_value"]
+
+    if information.get("time_text"):
+        updates["meeting_time"] = information["time_text"]
+
+    if information.get("meeting_purpose"):
+        updates["meeting_purpose"] = information["meeting_purpose"]
+
+    if updates:
+        manager.update(**updates)
+
+
+# ============================================================
+# GEMINI INFORMATION EXTRACTION
+# ============================================================
+
+def extract_information(
+    user_message: str,
+    manager: ConversationManager,
+) -> dict:
+    state = manager.get_state()
+    history = manager.get_history()[-8:]
+
+    history_text = "\n".join(
+        f"{message['role']}: {message['content']}"
+        for message in history
+    )
+
+    prompt = f"""
+You are the natural-language understanding layer of a professional
+AI receptionist.
+
+Your job is ONLY to understand the caller's latest message and
+extract information that is clearly present.
+
+Do not invent information.
+
+CURRENT CONVERSATION STATE
+
+Caller name:
+{state.caller_name}
+
+Caller email:
+{state.caller_email}
+
+Caller phone:
+{state.caller_phone}
+
+Meeting requested:
+{state.meeting_requested}
+
+Meeting date:
+{state.meeting_date}
+
+Meeting time:
+{state.meeting_time}
+
+Meeting purpose:
+{state.meeting_purpose}
+
+Awaiting confirmation:
+{state.awaiting_confirmation}
+
+RECENT CONVERSATION
+
+{history_text}
+
+LATEST CALLER MESSAGE
+
+{user_message}
+
+Return ONLY valid JSON using exactly these keys:
+
+{{
+  "intent": "booking | general | correction | confirmation | cancellation | unknown",
+  "caller_name": null,
+  "caller_email": null,
+  "caller_phone": null,
+  "date_text": null,
+  "time_text": null,
+  "meeting_purpose": null,
+  "wants_meeting": false,
+  "confirmation": null
+}}
+
+Rules:
+
+- Extract only information explicitly stated or clearly implied.
+- Do not invent a name, email, date, time, or purpose.
+- If the caller is correcting existing information, return intent "correction".
+- If the caller clearly wants a meeting, set wants_meeting to true.
+- If the caller is answering a previous receptionist question,
+  identify the corresponding information.
+- If the caller says yes/okay/confirm to a booking confirmation,
+  set confirmation to true.
+- If the caller rejects the booking, set confirmation to false.
+- Keep the response JSON only.
+"""
+
+    response = ask_gemini(prompt)
+
+    if not response:
+        return {}
+
+    cleaned = response.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+
+        cleaned = re.sub(
+            r"\s*```$",
+            "",
+            cleaned,
+        )
+
+    try:
+        data = json.loads(cleaned)
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception:
+        pass
+
+    return {}
+
+
+def apply_gemini_information(
+    information: dict,
+    manager: ConversationManager,
+):
+    updates = {}
+
+    if information.get("caller_name"):
+        updates["caller_name"] = information["caller_name"].strip()
+
+    if information.get("caller_email"):
+        updates["caller_email"] = information["caller_email"].strip()
+
+    if information.get("caller_phone"):
+        updates["caller_phone"] = information["caller_phone"].strip()
+
+    if information.get("meeting_purpose"):
+        updates["meeting_purpose"] = information["meeting_purpose"].strip()
+
+    if information.get("wants_meeting") is True:
+        updates["meeting_requested"] = True
+
+    date_text = information.get("date_text")
+
+    if date_text:
+        resolved_date = resolve_relative_date(
+            date_text,
+            reference_date=date.today(),
+        )
+
+        if resolved_date:
+            updates["meeting_date"] = resolved_date
+
+    time_text = information.get("time_text")
+
+    if time_text:
+        normalized_time = normalize_time(time_text)
+
+        if normalized_time:
+            updates["meeting_time"] = normalized_time
+
+    if updates:
+        manager.update(**updates)
+
+
+# ============================================================
+# GENERAL CONVERSATION
+# ============================================================
+
+def answer_general_question(
+    user_message: str,
+    manager: ConversationManager,
+) -> str:
+
+    company_context = build_context_prompt()
+    contacts_context = build_contacts_prompt()
+
+    history = manager.get_history()[-10:]
+
+    history_text = "\n".join(
+        f"{message['role']}: {message['content']}"
+        for message in history
+    )
+
+    prompt = f"""
+You are the AI receptionist for Agentic AI Solutions.
+
+Have a natural, professional conversation with the caller.
+Answer the caller's actual question first.
+Do not behave like a form.
+Remember information already provided.
+Do not repeatedly ask for information already given.
+Do not collect meeting details unless the caller wants a meeting.
+
+{company_context}
+
+{contacts_context}
+
+RECENT CONVERSATION:
+{history_text}
+
+CALLER'S LATEST MESSAGE:
+{user_message}
+
+Respond naturally as a professional receptionist.
+Never claim that a meeting has been booked unless the scheduler
+has successfully created the appointment.
+"""
+
+    response = ask_gemini(prompt)
+
+    if response:
+        return response.strip()
+
+    return (
+        "I'm sorry, I wasn't able to process that right now. "
+        "Could you please say that again?"
+    )
+
+
+# ============================================================
+# SPEECH FORMATTING
+# ============================================================
+
+def format_date_for_speech(date_value: str) -> str:
+    try:
+        parsed = datetime.strptime(date_value, "%Y-%m-%d")
+        return parsed.strftime("%A, %B %d")
+    except (ValueError, TypeError):
+        return date_value
+
+
+def format_time_for_speech(time_value: str) -> str:
+    try:
+        parsed = datetime.strptime(time_value, "%H:%M")
+        return parsed.strftime("%I:%M %p").lstrip("0")
+    except (ValueError, TypeError):
+        return time_value
+
+
+# ============================================================
+# BOOKING CONVERSATION
+# ============================================================
+
+def handle_booking(
+    manager: ConversationManager,
+) -> str:
+
+    state = manager.get_state()
+
+    if not state.meeting_requested:
+        manager.update(meeting_requested=True)
+        state = manager.get_state()
+
+    if not state.caller_name:
+        return "Absolutely. May I have your name?"
+
+    if not state.caller_email:
+        return (
+            f"Nice to meet you, {state.caller_name}. "
+            "Could I get your email address?"
+        )
+
+    if not state.meeting_date:
+        return "What day would you like to meet?"
+
+    if not state.meeting_time:
+        return "What time would work best for you?"
+
+    if not state.meeting_purpose:
+        return "And what would you like to discuss in the meeting?"
+
+    valid, validation_message = is_within_business_hours(
+        state.meeting_date,
+        state.meeting_time,
+        state.meeting_duration,
+    )
+
+    readable_date = format_date_for_speech(state.meeting_date)
+    readable_time = format_time_for_speech(state.meeting_time)
+
+    if not valid:
+        if "Monday to Friday" in validation_message:
+            return (
+                f"{readable_date} is outside our meeting schedule. "
+                "Meetings are available Monday through Friday. "
+                "Would you like to choose another day?"
+            )
+
+        if "before 9:00 AM" in validation_message:
+            return (
+                f"{readable_time} on {readable_date} is before "
+                "our business hours. Meetings are available "
+                "from 9:00 AM to 6:00 PM. "
+                "What time would work instead?"
+            )
+
+        if "latest available meeting start time" in validation_message:
+            return (
+                f"{readable_time} is outside our meeting hours. "
+                "The latest available meeting start time is "
+                "6:00 PM. What time would work instead?"
+            )
+
+        return (
+            f"{readable_time} on {readable_date} is not available "
+            "for a meeting. Could you choose another time?"
+        )
+
+    available = check_availability(
+        state.meeting_date,
+        state.meeting_time,
+        state.meeting_duration,
+    )
+
+    if not available:
+        alternatives = find_available_slots(
+            state.meeting_date,
+            state.meeting_duration,
+        )
+
+        if alternatives:
+            readable_alternatives = [
+                format_time_for_speech(slot)
+                for slot in alternatives[:4]
+            ]
+
+            if len(readable_alternatives) > 1:
+                joined = (
+                    ", ".join(readable_alternatives[:-1])
+                    + f", or {readable_alternatives[-1]}"
+                )
+            else:
+                joined = readable_alternatives[0]
+
+            return (
+                f"I'm sorry, {readable_time} on {readable_date} "
+                "is already booked. I have these available times: "
+                f"{joined}. Would any of those work for you?"
+            )
+
+        return (
+            f"I'm sorry, there aren't any available meeting slots "
+            f"on {readable_date}. Would you like to try another day?"
+        )
+
+    if not state.awaiting_confirmation:
+        manager.update(awaiting_confirmation=True)
+
+        return (
+            "Just to confirm, you'd like to meet with Harsha on "
+            f"{readable_date} at {readable_time} for "
+            f"{state.meeting_purpose}. Shall I book that for you?"
+        )
+
+    return (
+        f"Everything is ready for {readable_date} at "
+        f"{readable_time}. Shall I confirm the booking?"
+    )
+
+
+# ============================================================
+# CONFIRMATION DETECTION
+# ============================================================
+
+def is_positive_confirmation(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", text.lower().strip())
+
+    exact_phrases = {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "yes please",
+        "please do",
+        "confirm",
+        "confirmed",
+        "go ahead",
+        "okay",
+        "ok",
+        "sure",
+        "that's fine",
+        "that works",
+        "book it",
+        "please book",
+        "please book it",
+        "confirm it",
+        "please confirm",
+        "please confirm it",
+        "you may book",
+        "you may book it",
+        "you may confirm",
+        "you may confirm it",
+        "you can book",
+        "you can book it",
+        "you can confirm",
+        "you can confirm it",
+    }
+
+    if lowered in exact_phrases:
+        return True
+
+    if re.fullmatch(
+        r"(yes|yeah|yep|yup)\s+(you|u)\s+(may|can)\s+"
+        r"(book|confirm)(?:\s+it)?",
+        lowered,
+    ):
+        return True
+
+    if re.fullmatch(
+        r"go\s+ahead(?:\s+and)?\s+(book|confirm)(?:\s+it)?",
+        lowered,
+    ):
+        return True
+
+    if re.fullmatch(
+        r"(yes|yeah|yep|yup)(?:\s*,)?\s+please\s+"
+        r"(book|confirm)(?:\s+it)?",
+        lowered,
+    ):
+        return True
+
+    return False
+
+
+def is_negative_confirmation(text: str) -> bool:
+    lowered = re.sub(r"\s+", " ", text.lower().strip())
+
+    exact_phrases = {
+        "no",
+        "nope",
+        "not now",
+        "cancel",
+        "cancel it",
+        "don't book",
+        "do not book",
+        "don't confirm",
+        "do not confirm",
+        "no thanks",
+        "no thank you",
+    }
+
+    if lowered in exact_phrases:
+        return True
+
+    return bool(
+        re.fullmatch(
+            r"(no|nope)(?:\s*,)?\s+"
+            r"(?:don't|do not)\s+(?:book|confirm)(?:\s+it)?",
+            lowered,
+        )
+    )
+
+
+def is_cancellation_request(text: str) -> bool:
+    """Recognize explicit cancellation requests at any booking stage."""
+
+    lowered = re.sub(r"\s+", " ", text.lower().strip())
+
+    exact_phrases = {
+        "cancel",
+        "cancel it",
+        "cancel this",
+        "cancel the booking",
+        "cancel my booking",
+        "cancel this booking",
+        "cancel the meeting",
+        "cancel my meeting",
+        "cancel this meeting",
+        "cancel the appointment",
+        "cancel my appointment",
+        "stop booking",
+        "stop the booking",
+        "never mind",
+        "nevermind",
+        "forget it",
+        "don't book",
+        "do not book",
+        "don't schedule",
+        "do not schedule",
+    }
+
+    if lowered in exact_phrases:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:cancel|stop)\b.*\b(?:booking|meeting|appointment)\b",
+            lowered,
+        )
+    )
+
+
+# ============================================================
+# FINAL BOOKING
+# ============================================================
+
+def confirm_booking(
+    manager: ConversationManager,
+) -> str:
+
+    state = manager.get_state()
+
+    if not manager.is_ready_for_confirmation():
+        manager.update(awaiting_confirmation=False)
+        return handle_booking(manager)
+
+    result = create_appointment(
+        name=state.caller_name,
+        email=state.caller_email,
+        phone=state.caller_phone,
+        date=state.meeting_date,
+        start_time=state.meeting_time,
+        duration=state.meeting_duration,
+        purpose=state.meeting_purpose,
+    )
+
+    if not result.get("success"):
+        manager.update(awaiting_confirmation=False)
+
+        alternatives = result.get("available_slots", [])
+
+        if alternatives:
+            readable = [
+                format_time_for_speech(slot)
+                for slot in alternatives[:4]
+            ]
+
+            if len(readable) > 1:
+                slots_text = (
+                    ", ".join(readable[:-1])
+                    + f", or {readable[-1]}"
+                )
+            else:
+                slots_text = readable[0]
+
+            return (
+                "That time has just been taken. "
+                "I have these alternatives available: "
+                f"{slots_text}. Would you like one of those?"
+            )
+
+        return (
+            "I'm sorry, that time is no longer available. "
+            "Would you like me to find another slot?"
+        )
+
+    manager.update(
+        confirmed=True,
+        awaiting_confirmation=False,
+    )
+
+    readable_date = format_date_for_speech(state.meeting_date)
+    readable_time = format_time_for_speech(state.meeting_time)
+
+    return (
+        f"You're all set, {state.caller_name}. "
+        "Your meeting with Harsha is booked for "
+        f"{readable_date} at {readable_time}. Thank you!"
+    )
+
+
+# ============================================================
+# MAIN AGENT
+# ============================================================
+
+def ask_agent(
+    user_message: str,
+    manager: ConversationManager,
+) -> str:
+
+    user_message = user_message.strip()
+
+    if not user_message:
+        return "How can I help you?"
+
+    manager.add_message("user", user_message)
+
+    # Handle explicit cancellation before extracting new information.
+    # This works while collecting details as well as at confirmation.
+    state = manager.get_state()
+
+    if is_cancellation_request(user_message):
+        if state.confirmed:
+            response = (
+                "This meeting is already booked, so I can't cancel the "
+                "confirmed appointment from this conversation yet. "
+                "Please contact our team to change or cancel an existing appointment."
+            )
+            manager.add_message("assistant", response)
+            return response
+
+        if state.meeting_requested or state.awaiting_confirmation:
+            manager.update(
+                meeting_requested=False,
+                meeting_date=None,
+                meeting_time=None,
+                meeting_purpose=None,
+                meeting_duration=30,
+                awaiting_confirmation=False,
+                confirmed=False,
+            )
+
+            response = (
+                "No problem. I've cancelled the pending booking request. "
+                "No meeting has been booked. Would you like help with anything else?"
+            )
+            manager.add_message("assistant", response)
+            return response
+
+        response = (
+            "There isn't a pending booking request to cancel. "
+            "Would you like to schedule a meeting?"
+        )
+        manager.add_message("assistant", response)
+        return response
+
+    # Detect and apply locally understood information.
+    local_info = extract_simple_booking_information(
+        user_message,
+        manager,
+    )
+
+    apply_local_information(local_info, manager)
+
+    state = manager.get_state()
+
+    obvious_booking = (
+        local_info.get("wants_meeting") is True
+        or state.meeting_requested
+    )
+
+    # Handle pending confirmation locally.
+    if state.awaiting_confirmation:
+
+        if is_positive_confirmation(user_message):
+            response = confirm_booking(manager)
+            manager.add_message("assistant", response)
+            return response
+
+        if is_negative_confirmation(user_message):
+            manager.update(
+                meeting_requested=False,
+                meeting_date=None,
+                meeting_time=None,
+                meeting_purpose=None,
+                meeting_duration=30,
+                awaiting_confirmation=False,
+                confirmed=False,
+            )
+
+            response = (
+                "No problem. I won't book it. "
+                "Your contact details are saved for this conversation. "
+                "Would you like to arrange a different meeting?"
+            )
+
+            manager.add_message("assistant", response)
+            return response
+
+        # Allow date/time corrections while confirmation is pending.
+        correction_info = extract_simple_booking_information(
+            user_message,
+            manager,
+        )
+
+        if (
+            correction_info.get("date_value")
+            or correction_info.get("time_text")
+        ):
+            manager.update(awaiting_confirmation=False)
+
+            apply_local_information(correction_info, manager)
+
+            response = handle_booking(manager)
+            manager.add_message("assistant", response)
+            return response
+
+    # Continue booking locally.
+    if obvious_booking:
+        response = handle_booking(manager)
+        manager.add_message("assistant", response)
+        return response
+
+    # General questions use Gemini.
+    response = answer_general_question(user_message, manager)
+    manager.add_message("assistant", response)
+    return response

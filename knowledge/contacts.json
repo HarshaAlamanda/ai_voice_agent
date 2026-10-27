@@ -1,0 +1,33 @@
+{
+    "owner": {
+        "name": "Harsha Vardhan",
+        "role": "Founder",
+        "availability": "Monday to Friday during business hours",
+        "meeting_required": true
+    },
+
+    "company_contacts": {
+        "general_email": "aharsha1587@gmail.com",
+        "phone": "+91 7288946779"
+    },
+
+    "departments": {
+        "AI and Generative AI": {
+            "contact_method": "Schedule a meeting with the team"
+        },
+        "Web Applications": {
+            "contact_method": "Schedule a meeting with the team"
+        },
+        "Cloud and DevOps": {
+            "contact_method": "Schedule a meeting with the team"
+        }
+    },
+
+    "rules": [
+        "Do not invent phone numbers or email addresses.",
+        "Do not expose private contact information unless it is explicitly provided in this file.",
+        "If a caller asks to speak with the owner, offer to arrange a meeting.",
+        "Do not claim that the owner is personally available at a particular time unless availability has been confirmed.",
+        "Use the general company email when the caller asks for a general contact email."
+    ]
+}
